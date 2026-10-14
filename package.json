@@ -1,0 +1,62 @@
+{
+  "name": "@bicho-fyi/javascript",
+  "version": "1.0.0",
+  "publishConfig": { "access": "public" },
+  "description": "JavaScript SDK for reporting browser errors to Bicho",
+  "type": "module",
+  "author": {
+    "name": "FreshJuice",
+    "email": "contact@freshjuice.dev",
+    "url": "https://freshjuice.dev/"
+  },
+  "contributors": [
+    {
+      "name": "Alex Zappa",
+      "email": "alex@zappa.dev",
+      "url": "https://alex.zappa.dev/"
+    }
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/bicho-fyi/bicho-javascript.git"
+  },
+  "homepage": "https://bicho.fyi",
+  "bugs": {
+    "url": "https://github.com/bicho-fyi/bicho-javascript/issues"
+  },
+  "sideEffects": ["./dist/browser.js", "./dist/bicho.min.js"],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "jsdelivr": "./dist/bicho.min.js",
+  "unpkg": "./dist/bicho.min.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": "./dist/bicho.min.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "ACKNOWLEDGEMENTS.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "prepack": "npm run build",
+    "test": "npm run build && vitest run"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  }
+}

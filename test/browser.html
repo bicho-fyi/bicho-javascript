@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bicho browser checks</title>
+<h1>Bicho browser checks</h1>
+<pre id="result">Running local checks with a mocked transport...</pre>
+<script src="../dist/bicho.min.js"></script>
+<script type="module">
+import * as ESM from '../dist/index.js';
+
+const originalFetch = window.fetch;
+const result = document.querySelector('#result');
+const requests = [];
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+window.fetch = async (url, init) => {
+  requests.push({ url, ...init });
+  return new Response('{}');
+};
+try {
+  for (const SDK of [window.Bicho, ESM]) {
+    requests.length = 0;
+    SDK.init({ endpoint: 'https://collector.invalid/v1/logs', key: 'public-key', release: 'browser-check' });
+    const manual = SDK.captureException(new Error('native stack'));
+    const error = new ErrorEvent('error', { error: new Error('global error'), cancelable: true });
+    window.dispatchEvent(error);
+    const rejection = new PromiseRejectionEvent('unhandledrejection', { promise: Promise.resolve(), reason: 'rejection', cancelable: true });
+    window.dispatchEvent(rejection);
+    assert(!error.defaultPrevented && !rejection.defaultPrevented, 'SDK must preserve browser behavior');
+    assert(await SDK.flush(), 'flush should finish');
+    assert(requests.length === 3, 'manual, error and rejection events');
+    const resource = JSON.parse(requests[0].body).resourceLogs[0];
+    const record = resource.scopeLogs[0].logRecords[0];
+    const attrs = Object.fromEntries(record.attributes.map(item => [item.key, item.value.stringValue]));
+    const resources = Object.fromEntries(resource.resource.attributes.map(item => [item.key, item.value.stringValue]));
+    assert(attrs['log.record.uid'] === manual, 'stable ID');
+    assert(attrs['exception.stacktrace'].length > 0, 'native browser stack preserved');
+    assert(resources['service.version'] === 'browser-check', 'release');
+    assert(attrs.request === undefined && attrs.user === undefined, 'no automatic identity or request data');
+    assert(await SDK.close(), 'close should finish');
+    window.dispatchEvent(error);
+    assert(requests.length === 3, 'listeners removed');
+    assert(SDK.captureMessage('closed') === undefined, 'closed SDK is disabled');
+  }
+  result.textContent = 'PASS: ESM and IIFE, native browser stacks, global handlers, OTLP JSON and lifecycle. No collector requests were made.';
+} catch (error) {
+  result.textContent = `FAIL: ${error.stack ?? error}`;
+} finally {
+  await ESM.close(0);
+  await window.Bicho.close(0);
+  window.fetch = originalFetch;
+}
+</script>
+</html>
