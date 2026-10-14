@@ -43,8 +43,21 @@ test('npm tarball contains usable ESM, browser exports, declarations and license
       assert.equal(request.headers['X-Bicho-Key'], 'public-key');
     }
     assert.equal(requests.length, 2);
+    delete globalThis.window;
+    const server = esm.createClient({ endpoint: 'https://collector.invalid/v1/logs', key: 'server-key' });
+    const id = server.captureException(new Error('packed backend'));
+    assert.equal(await server.close(), true);
+    assert.equal(requests.length, 3);
+    const resource = JSON.parse(requests.at(-1).body).resourceLogs[0];
+    assert.equal(resource.scopeLogs[0].scope.name, 'bicho.javascript');
+    assert.equal(resource.scopeLogs[0].scope.version, manifest.version);
+    assert.equal(resource.scopeLogs[0].logRecords[0].attributes.find(item => item.key === 'log.record.uid').value.stringValue, id);
+    assert.equal(requests.at(-1).headers['X-Bicho-Key'], 'server-key');
     assert.match(readFileSync(join(root, manifest.types), 'utf8'), /export declare function init/);
+    assert.match(readFileSync(join(root, manifest.types), 'utf8'), /export declare function createClient/);
     assert.ok(packed.files.some(file => file.path === 'ACKNOWLEDGEMENTS.md'));
+    assert.ok(packed.files.some(file => file.path === 'CHANGELOG.md'));
+    assert.ok(readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`[${manifest.version}]`));
     assert.equal(manifest.license, 'Apache-2.0');
     assert.match(readFileSync(join(root, 'LICENSE'), 'utf8'), /Apache License\s+Version 2\.0/);
     assert.ok(!packed.files.some(file => file.path.startsWith('node_modules/')));

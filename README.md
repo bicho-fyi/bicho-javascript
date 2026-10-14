@@ -5,9 +5,9 @@
 [![Monthly downloads](https://img.shields.io/npm/dm/@bicho-fyi/javascript)](https://www.npmjs.com/package/@bicho-fyi/javascript)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
-Report browser errors to your [Bicho](https://bicho.fyi) server using OpenTelemetry's OTLP/HTTP JSON protocol. Initialize once to capture uncaught JavaScript errors and unhandled promise rejections, or report caught exceptions yourself.
+Report JavaScript errors to your [Bicho](https://bicho.fyi) server using OpenTelemetry's OTLP/HTTP JSON protocol. Browsers can capture uncaught errors and unhandled promise rejections automatically. Node.js reports exceptions explicitly.
 
-The SDK has no runtime dependencies. Use npm and ESM, or load the standalone script from jsDelivr. This is a browser error collector, not a full OpenTelemetry SDK or backend client.
+The SDK has no runtime dependencies. Use npm and ESM in browsers or Node.js 24+. The standalone script is for browsers. This is an error collector, not a full OpenTelemetry SDK.
 
 ## Install with npm
 
@@ -34,13 +34,44 @@ Use the generated `otlp.endpoint` and `otlp.headers['X-Bicho-Key']` from project
 
 The endpoint must use HTTPS, except on loopback for local development, and point to `/v1/logs`. URL credentials, query strings and fragments are rejected. Cross-origin JSON requests with `X-Bicho-Key` require preflight; Bicho supports it.
 
-ESM imports are safe during server rendering, but call `init()` only in the browser.
+ESM imports have no initialization side effects. `init()` configures the default client in browsers or on the server. Use `createClient()` for request-scoped backend reporting.
+
+## Node.js
+
+Use an isolated client for each request so concurrent requests do not share context, queues or shutdown:
+
+```js
+import { createClient } from '@bicho-fyi/javascript';
+
+const tracker = createClient({
+  endpoint: 'https://collector.example/v1/logs',
+  key: 'YOUR_PUBLIC_KEY',
+  serviceName: 'storefront/api',
+  environment: 'production',
+});
+
+try {
+  await handleRequest();
+} catch (error) {
+  tracker.captureException(error, {
+    contexts: { request: { route: '/api/orders' } },
+  });
+} finally {
+  await tracker.close(5000);
+}
+```
+
+Only pass context you intend to send; avoid request bodies and authorization headers.
+
+Backend capture is manual. The SDK does not install Node process listeners or change crash behavior. Use your framework's error handler. Await `flush()` or `close()` before a Node process exits. A returned UID means queued, not delivered; `close()` returns a delivery status and aborts outstanding work at its deadline.
+
+`createClient()` returns `captureException`, `captureMessage`, `flush` and `close`. Each instance has its own configuration and delivery state. The default service name is `app/backend` without a browser and `app/browser` in a browser. Browser automatic listeners still default to enabled; `autoCapture` has no effect on the backend. Projects requiring an ingest secret are not supported by this public-key SDK.
 
 ## Load from jsDelivr
 
 ```html
 <script
-  src="https://cdn.jsdelivr.net/npm/@bicho-fyi/javascript@1.0.0/dist/bicho.min.js"
+  src="https://cdn.jsdelivr.net/npm/@bicho-fyi/javascript@1.1.0/dist/bicho.min.js"
   data-endpoint="https://collector.example/v1/logs"
   data-key="YOUR_PUBLIC_KEY"
   data-service-name="storefront"
@@ -50,7 +81,7 @@ ESM imports are safe during server rendering, but call `init()` only in the brow
 ></script>
 ```
 
-The CDN URL becomes available after version 1.0.0 is published to npm. You can host `dist/bicho.min.js` yourself, or use `dist/index.js` with native browser ESM.
+The CDN URL becomes available after version 1.1.0 is published to npm. You can host `dist/bicho.min.js` yourself, or use `dist/index.js` with native browser ESM.
 
 | Attribute | Purpose |
 | --- | --- |
@@ -85,7 +116,7 @@ Exceptions and messages default to `error`. Bicho accepts exceptions at any seve
 
 ## Configuration
 
-`init()` requires `endpoint` and `key`. The default service name is `app/browser`. Optional settings are `serviceName`, `environment`, `release`, `tags`, `contexts`, `level`, `autoCapture` and `beforeSend`. Set `autoCapture: false` to disable listeners.
+`init()` and `createClient()` require `endpoint` and `key`. The default service name is `app/browser` in a browser or `app/backend` otherwise. Optional settings are `serviceName`, `environment`, `release`, `tags`, `contexts`, `level`, `autoCapture` and `beforeSend`. Set `autoCapture: false` to disable listeners.
 
 Tags accept scalar labels. Contexts hold structured objects, serialized as bounded JSON in the `bicho.contexts` attribute. Capture options override initial tags, contexts and level. Protocol-owned attributes cannot be replaced through tags.
 
@@ -118,7 +149,7 @@ Common sensitive keys are filtered in tags and contexts. Credentials, query stri
 
 The in-memory queue holds at most 30 events. Serialized payloads over 60 KiB are dropped. Requests time out after five seconds; queued events expire after 60 seconds.
 
-Only errors after initialization are captured. Caught exceptions, `console.error()`, failed HTTP requests and resource-loading failures without JavaScript error data are not automatic captures. Traces, sessions, page views, Web Vitals, breadcrumbs and replay are outside this SDK.
+Browser listeners capture only errors after initialization. Caught exceptions, `console.error()`, failed HTTP requests and resource-loading failures without JavaScript error data are not automatic captures. Backend errors always require explicit capture. Traces, sessions, page views, Web Vitals, breadcrumbs and replay are outside this SDK.
 
 Bicho derives recognized stack locations from sanitized stack text. The SDK does not upload source maps or attach debug IDs; a release label alone does not enable source-map enrichment. Modern browsers need Fetch, AbortController, Web Crypto and TextEncoder; no polyfills are included.
 
@@ -133,6 +164,10 @@ npm test
 ```
 
 `npm test` builds the SDK and runs Vitest, including packed npm tarball checks. Tests do not send errors to a live server. For manual browser checks, serve the repository locally and open `test/browser.html`.
+
+## Releases
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes. This package follows [Semantic Versioning](https://semver.org/).
 
 ## License
 

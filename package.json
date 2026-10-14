@@ -1,8 +1,8 @@
 {
   "name": "@bicho-fyi/javascript",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publishConfig": { "access": "public" },
-  "description": "JavaScript SDK for reporting browser errors to Bicho",
+  "description": "JavaScript SDK for reporting browser and backend errors to Bicho",
   "type": "module",
   "author": {
     "name": "FreshJuice",
@@ -41,6 +41,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "ACKNOWLEDGEMENTS.md",
     "LICENSE"
   ],

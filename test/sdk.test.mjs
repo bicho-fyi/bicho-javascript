@@ -58,7 +58,7 @@ test('OTLP JSON, identity, metadata and public-key transport', async () => {
   assert.equal(requests[0].headers['Content-Type'], 'application/json');
   const resource = wire().resourceLogs[0];
   assert.equal(attributes(resource.resource.attributes)['service.name'], 'app/browser');
-  assert.deepEqual(resource.scopeLogs[0].scope, { name: 'bicho.javascript.browser', version: '1.0.0' });
+  assert.deepEqual(resource.scopeLogs[0].scope, { name: 'bicho.javascript.browser', version: '1.1.0' });
   assert.equal(resource.scopeLogs[0].logRecords[0].severityNumber, 17);
   assert.match(resource.scopeLogs[0].logRecords[0].timeUnixNano, /^\d+$/);
   assert.equal(event().request, undefined);

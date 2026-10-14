@@ -2,7 +2,7 @@
 
 ## Project
 
-`@bicho-fyi/javascript` is a dependency-free browser error collector using OTLP/HTTP JSON. Read README.md and relevant source/tests before editing. Use npm and Node 24.
+`@bicho-fyi/javascript` is a dependency-free browser and backend error collector using OTLP/HTTP JSON. Read README.md and relevant source/tests before editing. Use npm and Node 24.
 
 - `src/index.ts`: side-effect-free ESM API; safe to import during server rendering.
 - `src/browser.ts`: standalone script initialization from data attributes.

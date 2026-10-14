@@ -29,22 +29,8 @@ export type Options = CaptureOptions & {
 
 type Pending = { payload: string; attempts: number; expires: number; ready: number };
 const encoder = new TextEncoder();
-const sdk = { name: 'bicho.javascript.browser', version: '1.0.0' };
 const levels: Level[] = ['fatal', 'error', 'warning', 'info', 'debug', 'log'];
 const sensitive = /password|passwd|secret|token|authorization|cookie|api[_-]?key|email|phone|address|^user$|^ip$/i;
-let options: Options | undefined;
-let endpoint = '';
-let fetcher: typeof fetch;
-let target: Window | undefined;
-let queue: Pending[] = [];
-let active: AbortController | undefined;
-let timer: ReturnType<typeof setTimeout> | undefined;
-let blockedUntil = 0;
-let failed = false;
-let capturing = false;
-let closing = false;
-let closingPromise: Promise<boolean> | undefined;
-const waiters = new Set<() => void>();
 
 function read(value: unknown, key: string): unknown {
   try { return value == null ? undefined : (value as Record<string, unknown>)[key]; }
@@ -116,237 +102,293 @@ function attribute(key: string, value: string | number | boolean) {
   return { key, value: typeof value === 'boolean' ? { boolValue: value } : typeof value === 'number' ? { doubleValue: value } : { stringValue: value } };
 }
 
-function serialize(event: Event): string {
-  const timeUnixNano = BigInt(Math.round(event.timestamp * 1000000)) * 1000n;
-  if (timeUnixNano > 18446744073709551615n) throw new Error('Invalid Bicho timestamp');
-  const attributes = Object.entries(event.tags ?? {}).filter(([key]) => !['exception.type', 'exception.message', 'exception.stacktrace', 'log.record.uid', 'bicho.contexts'].includes(key)).map(([key, value]) => attribute(key, value));
-  attributes.push(attribute('log.record.uid', event.event_id));
-  if (event.contexts) attributes.push(attribute('bicho.contexts', JSON.stringify(event.contexts)));
-  if (event.exception) {
-    attributes.push(attribute('exception.type', event.exception.type), attribute('exception.message', event.exception.message));
-    if (event.exception.stacktrace) attributes.push(attribute('exception.stacktrace', event.exception.stacktrace));
-  }
-  const resources = [attribute('service.name', scrub(options!.serviceName ?? 'app/browser'))];
-  if (event.release !== undefined) resources.push(attribute('service.version', event.release));
-  if (event.environment !== undefined) resources.push(attribute('deployment.environment.name', event.environment));
-  return JSON.stringify({ resourceLogs: [{ resource: { attributes: resources }, scopeLogs: [{ scope: sdk, logRecords: [{
-    timeUnixNano: timeUnixNano.toString(),
-    severityNumber: { fatal: 21, error: 17, warning: 13, info: 9, debug: 5, log: 9 }[event.level],
-    severityText: event.level.toUpperCase(), body: { stringValue: event.message ?? event.exception!.message }, attributes,
-  }] }] }] });
-}
+export type Client = {
+  captureException: (exception: unknown, options?: CaptureOptions) => string | undefined;
+  captureMessage: (message: string, options?: CaptureOptions) => string | undefined;
+  flush: (timeoutMs?: number) => Promise<boolean>;
+  close: (timeoutMs?: number) => Promise<boolean>;
+};
 
-function notify(): void {
-  if (!queue.length) for (const waiter of waiters) waiter();
-}
+export function createClient(configuration: Options): Client {
+  const browser = typeof window !== 'undefined' && typeof window.addEventListener === 'function';
+  const sdk = { name: browser ? 'bicho.javascript.browser' : 'bicho.javascript', version: '1.1.0' };
+  let options: Options | undefined;
+  let endpoint = '';
+  let fetcher: typeof fetch;
+  let target: Window | undefined;
+  let queue: Pending[] = [];
+  let active: AbortController | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let blockedUntil = 0;
+  let failed = false;
+  let capturing = false;
+  let closing = false;
+  let closingPromise: Promise<boolean> | undefined;
+  const waiters = new Set<() => void>();
 
-function retryAfter(value: string | null): number {
-  if (value === null) return 60000;
-  const seconds = /^\s*\d+(?:\.\d+)?\s*$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
-  return Number.isFinite(seconds) ? Math.max(0, seconds) : 60000;
-}
-
-function pump(): void {
-  if (active) return;
-  clearTimeout(timer);
-  timer = undefined;
-  while (queue.length && queue[0]!.expires <= Date.now()) {
-    queue.shift();
-    failed = true;
-  }
-  const item = queue[0];
-  if (!item) { notify(); return; }
-  if (Math.max(item.ready, blockedUntil) > Date.now()) {
-    timer = setTimeout(pump, Math.max(0, Math.min(Math.max(item.ready, blockedUntil), item.expires) - Date.now()));
-    return;
-  }
-  const controller = new AbortController();
-  active = controller;
-  const timeout = setTimeout(() => controller.abort(), Math.min(5000, Math.max(0, item.expires - Date.now())));
-  void send(item, controller).finally(() => clearTimeout(timeout));
-}
-
-async function send(item: Pending, controller: AbortController): Promise<void> {
-  let success = false;
-  let retry = false;
-  let delay = 1000 * 2 ** item.attempts;
-  try {
-    const response = await fetcher(endpoint, {
-      method: 'POST', body: item.payload, headers: { 'Content-Type': 'application/json', 'X-Bicho-Key': options!.key },
-      mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error', cache: 'no-store',
-      keepalive: true, signal: controller.signal,
-    });
-    if (active !== controller) return;
-    retry = [429, 502, 503, 504].includes(response.status);
-    if (response.headers.has('Retry-After')) delay = Math.max(delay, retryAfter(response.headers.get('Retry-After')));
-    if (response.status === 429) {
-      delay = Math.max(delay, retryAfter(response.headers.get('Retry-After')));
-      blockedUntil = Math.max(blockedUntil, Date.now() + delay);
-    }
-    if (response.status === 200) {
-      retry = false;
-      try {
-        const result: unknown = await response.json();
-        if (result && typeof result === 'object' && !Array.isArray(result) && read(result, 'error') === undefined) {
-          const partial = read(result, 'partialSuccess');
-          if (partial === undefined) success = true;
-          else if (partial && typeof partial === 'object' && !Array.isArray(partial)) {
-            const rejected = read(partial, 'rejectedLogRecords') ?? 0;
-            success = (typeof rejected === 'number' || typeof rejected === 'string') && /^(0|[1-9]\d*)$/.test(String(rejected)) && Number(rejected) === 0;
-          }
-        }
-      } catch {}
-    } else if (response.body) void response.body.cancel().catch(() => {});
-  } catch { retry = true; }
-  if (active !== controller) return;
-  active = undefined;
-  if (!success && retry && item.attempts < 2 && Date.now() + delay < item.expires) {
-    item.attempts++;
-    item.ready = Date.now() + delay;
-  } else {
-    queue.shift();
-    if (!success) failed = true;
-  }
-  pump();
-}
-
-function capture(value: unknown, captureOptions: CaptureOptions, message: boolean, fallback?: string): string | undefined {
-  if (!options || closing || capturing || queue.length >= 30 || blockedUntil > Date.now()) return undefined;
-  capturing = true;
-  try {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    bytes[6] = (bytes[6]! & 15) | 64;
-    bytes[8] = (bytes[8]! & 63) | 128;
-    const id = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-    const level = captureOptions.level ?? options.level ?? 'error';
-    if (!levels.includes(level)) return undefined;
-    let event: Event = {
-      event_id: id, timestamp: Date.now() / 1000, platform: 'javascript', level,
-      environment: options.environment, release: options.release,
-      tags: tags({ ...options.tags, ...captureOptions.tags }),
-      contexts: normalize({ ...options.contexts, ...captureOptions.contexts }) as Record<string, unknown>, sdk: { ...sdk },
-    };
-    if (message) event.message = scrub(text(value, 16384));
-    else {
-      const stack = read(value, 'stack');
-      const name = read(value, 'name');
-      const errorMessage = read(value, 'message');
-      event.exception = {
-        type: typeof name === 'string' ? scrub(name.slice(0, 512)) : 'NonError',
-        message: scrub(text(typeof errorMessage === 'string' ? errorMessage : value, 16384)),
-        ...(typeof stack === 'string' && stack ? { stacktrace: scrub(stack.slice(0, 32768)) } : fallback ? { stacktrace: fallback } : {}),
-      };
-    }
-    if (options.beforeSend) {
-      const changed = options.beforeSend(event);
-      if (changed && typeof read(changed, 'then') === 'function') {
-        void Promise.resolve(changed).catch(() => {});
-        return undefined;
-      }
-      if (!changed || typeof changed !== 'object') return undefined;
-      event = changed;
-    }
-    if (closing || !levels.includes(event.level)) return undefined;
-    const clean: Event = {
-      event_id: id, timestamp: event.timestamp, platform: 'javascript', level: event.level,
-      sdk: { ...sdk }, tags: tags(event.tags),
-      ...(event.contexts && typeof event.contexts === 'object' ? { contexts: normalize(event.contexts) as Record<string, unknown> } : {}),
-    };
-    if (!Number.isFinite(clean.timestamp) || clean.timestamp < 0 || clean.timestamp > 253402300799) return undefined;
-    if (typeof event.environment === 'string') clean.environment = scrub(event.environment.slice(0, 512));
-    if (typeof event.release === 'string') clean.release = scrub(event.release.slice(0, 512));
-    if (typeof event.message === 'string') clean.message = scrub(event.message.slice(0, 16384));
+  function serialize(event: Event): string {
+    const timeUnixNano = BigInt(Math.round(event.timestamp * 1000000)) * 1000n;
+    if (timeUnixNano > 18446744073709551615n) throw new Error('Invalid Bicho timestamp');
+    const attributes = Object.entries(event.tags ?? {}).filter(([key]) => !['exception.type', 'exception.message', 'exception.stacktrace', 'log.record.uid', 'bicho.contexts'].includes(key)).map(([key, value]) => attribute(key, value));
+    attributes.push(attribute('log.record.uid', event.event_id));
+    if (event.contexts) attributes.push(attribute('bicho.contexts', JSON.stringify(event.contexts)));
     if (event.exception) {
-      clean.exception = {
-        type: scrub(text(event.exception.type, 512)), message: scrub(text(event.exception.message, 16384)),
-        ...(typeof event.exception.stacktrace === 'string' ? { stacktrace: scrub(event.exception.stacktrace.slice(0, 32768)) } : {}),
-      };
+      attributes.push(attribute('exception.type', event.exception.type), attribute('exception.message', event.exception.message));
+      if (event.exception.stacktrace) attributes.push(attribute('exception.stacktrace', event.exception.stacktrace));
     }
-    if (clean.message === undefined && !clean.exception) return undefined;
-    const payload = serialize(clean);
-    const length = encoder.encode(payload).length;
-    if (length > 60 * 1024) return undefined;
-    queue.push({ payload, attempts: 0, expires: Date.now() + 60000, ready: 0 });
+    const resources = [attribute('service.name', scrub(options!.serviceName ?? (browser ? 'app/browser' : 'app/backend')))];
+    if (event.release !== undefined) resources.push(attribute('service.version', event.release));
+    if (event.environment !== undefined) resources.push(attribute('deployment.environment.name', event.environment));
+    return JSON.stringify({ resourceLogs: [{ resource: { attributes: resources }, scopeLogs: [{ scope: sdk, logRecords: [{
+      timeUnixNano: timeUnixNano.toString(),
+      severityNumber: { fatal: 21, error: 17, warning: 13, info: 9, debug: 5, log: 9 }[event.level],
+      severityText: event.level.toUpperCase(), body: { stringValue: event.message ?? event.exception!.message }, attributes,
+    }] }] }] });
+  }
+
+  function notify(): void {
+    if (!queue.length) for (const waiter of waiters) waiter();
+  }
+
+  function retryAfter(value: string | null): number {
+    if (value === null) return 60000;
+    const seconds = /^\s*\d+(?:\.\d+)?\s*$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+    return Number.isFinite(seconds) ? Math.max(0, seconds) : 60000;
+  }
+
+  function pump(): void {
+    if (active) return;
+    clearTimeout(timer);
+    timer = undefined;
+    while (queue.length && queue[0]!.expires <= Date.now()) {
+      queue.shift();
+      failed = true;
+    }
+    const item = queue[0];
+    if (!item) { notify(); return; }
+    if (Math.max(item.ready, blockedUntil) > Date.now()) {
+      timer = setTimeout(pump, Math.max(0, Math.min(Math.max(item.ready, blockedUntil), item.expires) - Date.now()));
+      return;
+    }
+    const controller = new AbortController();
+    active = controller;
+    const timeout = setTimeout(() => controller.abort(), Math.min(5000, Math.max(0, item.expires - Date.now())));
+    void send(item, controller).finally(() => clearTimeout(timeout));
+  }
+
+  async function send(item: Pending, controller: AbortController): Promise<void> {
+    let success = false;
+    let retry = false;
+    let delay = 1000 * 2 ** item.attempts;
+    try {
+      const response = await fetcher(endpoint, {
+        method: 'POST', body: item.payload, headers: { 'Content-Type': 'application/json', 'X-Bicho-Key': options!.key },
+        mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: browser ? 'error' : 'manual', cache: 'no-store',
+        keepalive: true, signal: controller.signal,
+      });
+      if (active !== controller) return;
+      retry = [429, 502, 503, 504].includes(response.status);
+      if (response.headers.has('Retry-After')) delay = Math.max(delay, retryAfter(response.headers.get('Retry-After')));
+      if (response.status === 429) {
+        delay = Math.max(delay, retryAfter(response.headers.get('Retry-After')));
+        blockedUntil = Math.max(blockedUntil, Date.now() + delay);
+      }
+      if (response.status === 200) {
+        retry = false;
+        try {
+          const result: unknown = await response.json();
+          if (result && typeof result === 'object' && !Array.isArray(result) && read(result, 'error') === undefined) {
+            const partial = read(result, 'partialSuccess');
+            if (partial === undefined) success = true;
+            else if (partial && typeof partial === 'object' && !Array.isArray(partial)) {
+              const rejected = read(partial, 'rejectedLogRecords') ?? 0;
+              success = (typeof rejected === 'number' || typeof rejected === 'string') && /^(0|[1-9]\d*)$/.test(String(rejected)) && Number(rejected) === 0;
+            }
+          }
+        } catch {}
+      } else if (response.body) void response.body.cancel().catch(() => {});
+    } catch { retry = true; }
+    if (active !== controller) return;
+    active = undefined;
+    if (!success && retry && item.attempts < 2 && Date.now() + delay < item.expires) {
+      item.attempts++;
+      item.ready = Date.now() + delay;
+    } else {
+      queue.shift();
+      if (!success) failed = true;
+    }
     pump();
-    return id;
-  } catch { return undefined; }
-  finally { capturing = false; }
+  }
+
+  function capture(value: unknown, captureOptions: CaptureOptions, message: boolean, fallback?: string): string | undefined {
+    if (!options || closing || capturing || queue.length >= 30 || blockedUntil > Date.now()) return undefined;
+    capturing = true;
+    try {
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      bytes[6] = (bytes[6]! & 15) | 64;
+      bytes[8] = (bytes[8]! & 63) | 128;
+      const id = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      const level = captureOptions.level ?? options.level ?? 'error';
+      if (!levels.includes(level)) return undefined;
+      let event: Event = {
+        event_id: id, timestamp: Date.now() / 1000, platform: 'javascript', level,
+        environment: options.environment, release: options.release,
+        tags: tags({ ...options.tags, ...captureOptions.tags }),
+        contexts: normalize({ ...options.contexts, ...captureOptions.contexts }) as Record<string, unknown>, sdk: { ...sdk },
+      };
+      if (message) event.message = scrub(text(value, 16384));
+      else {
+        const stack = read(value, 'stack');
+        const name = read(value, 'name');
+        const errorMessage = read(value, 'message');
+        event.exception = {
+          type: typeof name === 'string' ? scrub(name.slice(0, 512)) : 'NonError',
+          message: scrub(text(typeof errorMessage === 'string' ? errorMessage : value, 16384)),
+          ...(typeof stack === 'string' && stack ? { stacktrace: scrub(stack.slice(0, 32768)) } : fallback ? { stacktrace: fallback } : {}),
+        };
+      }
+      if (options.beforeSend) {
+        const changed = options.beforeSend(event);
+        if (changed && typeof read(changed, 'then') === 'function') {
+          void Promise.resolve(changed).catch(() => {});
+          return undefined;
+        }
+        if (!changed || typeof changed !== 'object') return undefined;
+        event = changed;
+      }
+      if (closing || !levels.includes(event.level)) return undefined;
+      const clean: Event = {
+        event_id: id, timestamp: event.timestamp, platform: 'javascript', level: event.level,
+        sdk: { ...sdk }, tags: tags(event.tags),
+        ...(event.contexts && typeof event.contexts === 'object' ? { contexts: normalize(event.contexts) as Record<string, unknown> } : {}),
+      };
+      if (!Number.isFinite(clean.timestamp) || clean.timestamp < 0 || clean.timestamp > 253402300799) return undefined;
+      if (typeof event.environment === 'string') clean.environment = scrub(event.environment.slice(0, 512));
+      if (typeof event.release === 'string') clean.release = scrub(event.release.slice(0, 512));
+      if (typeof event.message === 'string') clean.message = scrub(event.message.slice(0, 16384));
+      if (event.exception) {
+        clean.exception = {
+          type: scrub(text(event.exception.type, 512)), message: scrub(text(event.exception.message, 16384)),
+          ...(typeof event.exception.stacktrace === 'string' ? { stacktrace: scrub(event.exception.stacktrace.slice(0, 32768)) } : {}),
+        };
+      }
+      if (clean.message === undefined && !clean.exception) return undefined;
+      const payload = serialize(clean);
+      const length = encoder.encode(payload).length;
+      if (length > 60 * 1024) return undefined;
+      queue.push({ payload, attempts: 0, expires: Date.now() + 60000, ready: 0 });
+      pump();
+      return id;
+    } catch { return undefined; }
+    finally { capturing = false; }
+  }
+
+  function onError(event: ErrorEvent): void {
+    try {
+      if (!event.error && !event.message) return;
+      const fallback = event.filename && event.lineno > 0 && event.colno > 0
+        ? `    at ${scrub(event.filename).split(/[?#]/)[0]}:${event.lineno}:${event.colno}` : undefined;
+      capture(event.error ?? event.message, {}, false, fallback);
+    } catch {}
+  }
+
+  function onRejection(event: PromiseRejectionEvent): void {
+    try { capture(event.reason, {}, false); } catch {}
+  }
+
+  function init(configuration: Options): void {
+    const url = validateEndpoint(configuration.endpoint, configuration.key);
+    if (options) throw new Error('Bicho is already initialized; await close() before init()');
+    if (typeof fetch !== 'function' || typeof globalThis.crypto?.getRandomValues !== 'function') {
+      throw new Error('Bicho requires Fetch and Web Crypto');
+    }
+    for (const key of ['environment', 'release', 'serviceName'] as const) {
+      if (configuration[key] !== undefined && (typeof configuration[key] !== 'string' || configuration[key].length > 512)) throw new Error(`Invalid Bicho ${key}`);
+    }
+    if (configuration.beforeSend !== undefined && typeof configuration.beforeSend !== 'function') throw new Error('Invalid Bicho beforeSend');
+    if (configuration.level !== undefined && !levels.includes(configuration.level)) throw new Error('Invalid Bicho level');
+    options = { ...configuration };
+    endpoint = url;
+    fetcher = fetch.bind(globalThis);
+    blockedUntil = 0;
+    failed = false;
+    closing = false;
+    closingPromise = undefined;
+    if (configuration.autoCapture !== false && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      target = window;
+      target.addEventListener('error', onError);
+      target.addEventListener('unhandledrejection', onRejection);
+    }
+  }
+
+  function captureException(exception: unknown, captureOptions: CaptureOptions = {}): string | undefined {
+    return capture(exception, captureOptions, false);
+  }
+
+  function captureMessage(message: string, captureOptions: CaptureOptions = {}): string | undefined {
+    return capture(message, captureOptions, true);
+  }
+
+  function flush(timeoutMs = 2000): Promise<boolean> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return Promise.resolve(false);
+    if (!queue.length) return Promise.resolve(!failed);
+    return new Promise(resolve => {
+      const done = () => { clearTimeout(timeout); waiters.delete(done); resolve(!failed); };
+      const timeout = setTimeout(() => { waiters.delete(done); resolve(false); }, Math.min(timeoutMs, 2147483647));
+      waiters.add(done);
+    });
+  }
+
+  function close(timeoutMs = 2000): Promise<boolean> {
+    if (closingPromise) return closingPromise;
+    if (!options) return Promise.resolve(true);
+    closing = true;
+    target?.removeEventListener('error', onError);
+    target?.removeEventListener('unhandledrejection', onRejection);
+    target = undefined;
+    closingPromise = (async () => {
+      const result = await flush(timeoutMs);
+      clearTimeout(timer);
+      const controller = active;
+      active = undefined;
+      controller?.abort();
+      if (queue.length) failed = true;
+      queue = [];
+      notify();
+      options = undefined;
+      return result;
+    })();
+    return closingPromise;
+  }
+
+  init(configuration);
+  return { captureException, captureMessage, flush, close };
 }
 
-function onError(event: ErrorEvent): void {
-  try {
-    if (!event.error && !event.message) return;
-    const fallback = event.filename && event.lineno > 0 && event.colno > 0
-      ? `    at ${scrub(event.filename).split(/[?#]/)[0]}:${event.lineno}:${event.colno}` : undefined;
-    capture(event.error ?? event.message, {}, false, fallback);
-  } catch {}
-}
-
-function onRejection(event: PromiseRejectionEvent): void {
-  try { capture(event.reason, {}, false); } catch {}
-}
+let client: Client | undefined;
 
 export function init(configuration: Options): void {
-  const url = validateEndpoint(configuration.endpoint, configuration.key);
-  if (options) throw new Error('Bicho is already initialized; await close() before init()');
-  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function' || typeof fetch !== 'function' || typeof crypto?.getRandomValues !== 'function') {
-    throw new Error('Bicho requires a browser with Fetch, Web Crypto and event listeners');
-  }
-  for (const key of ['environment', 'release', 'serviceName'] as const) {
-    if (configuration[key] !== undefined && (typeof configuration[key] !== 'string' || configuration[key].length > 512)) throw new Error(`Invalid Bicho ${key}`);
-  }
-  if (configuration.beforeSend !== undefined && typeof configuration.beforeSend !== 'function') throw new Error('Invalid Bicho beforeSend');
-  if (configuration.level !== undefined && !levels.includes(configuration.level)) throw new Error('Invalid Bicho level');
-  options = { ...configuration };
-  endpoint = url;
-  fetcher = fetch.bind(globalThis);
-  blockedUntil = 0;
-  failed = false;
-  closing = false;
-  closingPromise = undefined;
-  if (configuration.autoCapture !== false) {
-    target = window;
-    target.addEventListener('error', onError);
-    target.addEventListener('unhandledrejection', onRejection);
-  }
+  validateEndpoint(configuration.endpoint, configuration.key);
+  if (client) throw new Error('Bicho is already initialized; await close() before init()');
+  client = createClient(configuration);
 }
 
-export function captureException(exception: unknown, captureOptions: CaptureOptions = {}): string | undefined {
-  return capture(exception, captureOptions, false);
+export function captureException(exception: unknown, options: CaptureOptions = {}): string | undefined {
+  return client?.captureException(exception, options);
 }
 
-export function captureMessage(message: string, captureOptions: CaptureOptions = {}): string | undefined {
-  return capture(message, captureOptions, true);
+export function captureMessage(message: string, options: CaptureOptions = {}): string | undefined {
+  return client?.captureMessage(message, options);
 }
 
 export function flush(timeoutMs = 2000): Promise<boolean> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return Promise.resolve(false);
-  if (!queue.length) return Promise.resolve(!failed);
-  return new Promise(resolve => {
-    const done = () => { clearTimeout(timeout); waiters.delete(done); resolve(!failed); };
-    const timeout = setTimeout(() => { waiters.delete(done); resolve(false); }, Math.min(timeoutMs, 2147483647));
-    waiters.add(done);
-  });
+  return client?.flush(timeoutMs) ?? Promise.resolve(true);
 }
 
-export function close(timeoutMs = 2000): Promise<boolean> {
-  if (closingPromise) return closingPromise;
-  if (!options) return Promise.resolve(true);
-  closing = true;
-  target?.removeEventListener('error', onError);
-  target?.removeEventListener('unhandledrejection', onRejection);
-  target = undefined;
-  closingPromise = (async () => {
-    const result = await flush(timeoutMs);
-    clearTimeout(timer);
-    const controller = active;
-    active = undefined;
-    controller?.abort();
-    if (queue.length) failed = true;
-    queue = [];
-    notify();
-    options = undefined;
-    return result;
-  })();
-  return closingPromise;
+export async function close(timeoutMs = 2000): Promise<boolean> {
+  const closing = client;
+  if (!closing) return true;
+  const result = await closing.close(timeoutMs);
+  if (client === closing) client = undefined;
+  return result;
 }
