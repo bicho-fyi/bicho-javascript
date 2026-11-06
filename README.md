@@ -171,4 +171,4 @@ See [CHANGELOG.md](./CHANGELOG.md) for release notes. This package follows [Sema
 
 ## License
 
-Copyright 2026 Alex Zappa (FreshJuice). Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE).
+Copyright 2026 [Alex Zappa](https://alex.zappa.dev/) ([FreshJuice](https://freshjuice.dev/)). Licensed under Apache-2.0. See [LICENSE](LICENSE) and [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
